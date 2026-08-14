@@ -2,7 +2,7 @@
   "use strict";
   const KEY = "videoStabilizerSettings";
   const DEFAULTS = { enabled: true, applyStabilization: false, showDiagnostics: true, analysisMaxDimension: 320, analysisFps: 15, smoothingRadius: 12, cropZoom: 1.03, minConfidence: 0.3 };
-  const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, source: "", originalStyle: null,
+  const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, source: "", originalStyle: null, canvasBlockedUntil: 0,
     status: { videoDetected: false, sourceSize: null, analysisSize: null, canvas: "pending", worker: "pending", wasm: "pending", wasmResult: null, processedFrames: 0, processingMs: null, featureCount: 0, confidence: 0, trackingStatus: "idle", correction: null, lastError: null } };
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -41,14 +41,14 @@
 
   function restoreTransform() {
     if (!state.video || !state.originalStyle) return;
-    for (const [property, value] of Object.entries(state.originalStyle)) value ? state.video.style.setProperty(property, value) : state.video.style.removeProperty(property);
+    for (const [property, style] of Object.entries(state.originalStyle)) style.value ? state.video.style.setProperty(property, style.value, style.priority) : state.video.style.removeProperty(property);
     state.originalStyle = null;
   }
 
   function applyTransform(result) {
     if (!state.video || !state.settings.applyStabilization || !result?.correction) { restoreTransform(); return; }
     if (result.status === "ok" && result.confidence < state.settings.minConfidence) return;
-    if (!state.originalStyle) state.originalStyle = Object.fromEntries(["transform", "transform-origin", "transition", "will-change"].map((property) => [property, state.video.style.getPropertyValue(property)]));
+    if (!state.originalStyle) state.originalStyle = Object.fromEntries(["transform", "transform-origin", "transition", "will-change"].map((property) => [property, { value: state.video.style.getPropertyValue(property), priority: state.video.style.getPropertyPriority(property) }]));
     const rect = state.video.getBoundingClientRect(); const x = result.correction.x * rect.width / result.sourceWidth; const y = result.correction.y * rect.height / result.sourceHeight;
     const scale = clamp(state.settings.cropZoom * result.correction.scale, 0.92, 1.2);
     state.video.style.setProperty("transform-origin", "50% 50%", "important"); state.video.style.setProperty("transition", "none", "important"); state.video.style.setProperty("will-change", "transform", "important");
@@ -91,8 +91,10 @@
     else { state.callbackType = "animation"; state.callback = requestAnimationFrame((now) => { state.callback = null; scheduleFrame(); sample(now, { mediaTime: state.video?.currentTime }); }); }
   }
 
+  const CANVAS_BLOCKED_RETRY_MS = 15000;
+
   function attach(video) {
-    if (video === state.video) return; cancelFrame(); restoreTransform(); state.video = video; state.source = ""; state.lastSample = 0; resetWorker("video-change");
+    if (video === state.video) return; cancelFrame(); restoreTransform(); state.video = video; state.source = ""; state.lastSample = 0; state.canvasBlockedUntil = 0; resetWorker("video-change");
     update({ videoDetected: Boolean(video), sourceSize: video?.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : null, analysisSize: null, canvas: "pending", trackingStatus: video ? "waiting-frame" : "idle" });
     if (video) scheduleFrame();
   }
@@ -100,15 +102,25 @@
   function sample(now, metadata) {
     if (!state.settings.enabled || !state.ready || state.busy || !state.video || state.video.paused || state.video.ended || document.hidden) return;
     if (now - state.lastSample < 1000 / state.settings.analysisFps || state.video.readyState < 2 || !state.video.videoWidth) return;
-    const source = `${state.video.currentSrc}|${state.video.videoWidth}x${state.video.videoHeight}`; if (source !== state.source) { state.source = source; resetWorker("source-change"); }
+    const source = `${state.video.currentSrc}|${state.video.videoWidth}x${state.video.videoHeight}`;
+    if (source !== state.source) { state.source = source; state.canvasBlockedUntil = 0; resetWorker("source-change"); }
+    // A SecurityError (tainted/DRM canvas) won't clear up until the source changes, so back off
+    // instead of retrying drawImage()/getImageData() and re-notifying on every video frame.
+    if (state.canvasBlockedUntil && now < state.canvasBlockedUntil) return;
     const scale = Math.min(1, state.settings.analysisMaxDimension / Math.max(state.video.videoWidth, state.video.videoHeight)); const width = Math.max(32, Math.round(state.video.videoWidth * scale)); const height = Math.max(32, Math.round(state.video.videoHeight * scale));
     try {
       state.canvas ??= document.createElement("canvas"); state.context ??= state.canvas.getContext("2d", { alpha: false, willReadFrequently: true }); if (!state.context) throw new Error("2D Contextを作成できません");
       if (state.canvas.width !== width || state.canvas.height !== height) { state.canvas.width = width; state.canvas.height = height; }
       state.context.drawImage(state.video, 0, 0, width, height); const image = state.context.getImageData(0, 0, width, height); state.lastSample = now; state.busy = true; state.frame += 1;
+      state.canvasBlockedUntil = 0;
       update({ canvas: "ok", sourceSize: `${state.video.videoWidth}×${state.video.videoHeight}`, analysisSize: `${width}×${height}`, lastError: null });
       state.worker.postMessage({ type: "frame", id: state.frame, width, height, timestamp: metadata.mediaTime ?? state.video.currentTime, buffer: image.data.buffer }, [image.data.buffer]);
-    } catch (error) { state.busy = false; update({ canvas: error?.name === "SecurityError" ? "blocked" : "error", lastError: error?.name === "SecurityError" ? "Twitch映像のCanvas画素取得がSecurityErrorで拒否されました" : `Canvas: ${error.message || error}` }); }
+    } catch (error) {
+      state.busy = false; state.lastSample = now;
+      const blocked = error?.name === "SecurityError";
+      if (blocked) state.canvasBlockedUntil = now + CANVAS_BLOCKED_RETRY_MS;
+      update({ canvas: blocked ? "blocked" : "error", lastError: blocked ? "Twitch映像のCanvas画素取得がSecurityErrorで拒否されました" : `Canvas: ${error.message || error}` });
+    }
   }
 
   async function applySettings(patch, persist = false) {
