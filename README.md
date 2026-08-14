@@ -20,6 +20,7 @@ Twitch <video>
 ```
 
 計画・詳細設計は [Issue #1](https://github.com/azumag/video_stabilizer/issues/1) を参照してください。
+開発を再開する担当者は、まず [`docs/HANDOVER.md`](docs/HANDOVER.md) を参照してください。
 
 ## 現在できること
 
