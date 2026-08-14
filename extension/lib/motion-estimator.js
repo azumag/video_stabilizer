@@ -49,12 +49,10 @@ function resize(gray, width, height, maxDimension) {
 
 function frameDifference(first, second) {
   let total = 0;
-  let count = 0;
-  for (let index = 0; index < first.length; index += 4) {
+  for (let index = 0; index < first.length; index += 1) {
     total += Math.abs(first[index] - second[index]);
-    count += 1;
   }
-  return total / Math.max(1, count);
+  return total / Math.max(1, first.length);
 }
 
 function cornerScore(gray, width, x, y) {

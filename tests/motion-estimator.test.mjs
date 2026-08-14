@@ -148,6 +148,34 @@ test("RANSAC rejects outliers and estimates a similarity transform", () => {
   assert.equal(model.inlierCount, 30);
 });
 
+test("MotionStabilizer detects a scene cut even when only a stride-4 sample would miss it", () => {
+  // Regression test for #2: frameDifference() used to walk the grayscale
+  // buffer (1 byte/pixel) with a stride of 4, so it only ever compared the
+  // pixels at x % 4 === 0. A frame where exactly those columns stay black
+  // and everything else turns white looks unchanged to that sampling, even
+  // though ~75% of the frame changed.
+  const width = 64;
+  const height = 64;
+  const firstRgba = new Uint8ClampedArray(width * height * 4).fill(0);
+  for (let index = 3; index < firstRgba.length; index += 4) firstRgba[index] = 255; // alpha
+  const secondRgba = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const value = x % 4 === 0 ? 0 : 255;
+      const index = (y * width + x) * 4;
+      secondRgba[index] = value;
+      secondRgba[index + 1] = value;
+      secondRgba[index + 2] = value;
+      secondRgba[index + 3] = 255;
+    }
+  }
+
+  const stabilizer = new MotionStabilizer({ trackingMaxDimension: width, sceneCutThreshold: 58 });
+  assert.equal(stabilizer.processRgba(firstRgba, width, height, 0).status, "initialized");
+  const result = stabilizer.processRgba(secondRgba, width, height, 1 / 30);
+  assert.equal(result.status, "scene-cut", JSON.stringify(result));
+});
+
 test("MotionStabilizer returns an opposing correction for translated frames", () => {
   const width = 160;
   const height = 100;
