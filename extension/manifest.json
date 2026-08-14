@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Video Stabilizer",
+  "short_name": "Video Stabilizer",
+  "version": "0.1.0",
+  "description": "Twitch映像のCanvas取得・Worker・WASMとリアルタイム安定化を検証するPhase 0拡張機能です。",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.twitch.tv/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Twitch Video Stabilizer",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.twitch.tv/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "worker.js",
+        "lib/motion-estimator.js",
+        "wasm/probe.wasm"
+      ],
+      "matches": [
+        "https://www.twitch.tv/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  }
+}

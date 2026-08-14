@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Twitch Video Stabilizer</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Video Stabilizer</h1>
+          <p>Phase 0 診断版</p>
+        </div>
+        <span class="badge">Twitch</span>
+      </header>
+
+      <section class="card controls">
+        <label class="switch-row">
+          <span>
+            <strong>拡張機能を有効化</strong>
+            <small>Canvas・Worker・WASMを検証</small>
+          </span>
+          <input id="enabled" type="checkbox">
+        </label>
+
+        <label class="switch-row">
+          <span>
+            <strong>補正を画面へ適用</strong>
+            <small>初期実装のため既定はOFF</small>
+          </span>
+          <input id="applyStabilization" type="checkbox">
+        </label>
+
+        <label class="switch-row">
+          <span>
+            <strong>診断パネルを表示</strong>
+            <small>Twitch画面右下に表示</small>
+          </span>
+          <input id="showDiagnostics" type="checkbox">
+        </label>
+      </section>
+
+      <section class="card form-grid">
+        <label for="analysisMaxDimension">解析サイズ</label>
+        <select id="analysisMaxDimension">
+          <option value="240">最大240px</option>
+          <option value="320">最大320px</option>
+          <option value="480">最大480px</option>
+          <option value="640">最大640px</option>
+        </select>
+
+        <label for="analysisFps">解析頻度</label>
+        <select id="analysisFps">
+          <option value="10">10 fps</option>
+          <option value="15">15 fps</option>
+          <option value="20">20 fps</option>
+          <option value="30">30 fps</option>
+        </select>
+
+        <label for="smoothingRadius">平滑化</label>
+        <input id="smoothingRadius" type="range" min="2" max="40" step="1">
+        <output id="smoothingRadiusValue">12 frames</output>
+
+        <label for="cropZoom">端のクロップ</label>
+        <input id="cropZoom" type="range" min="1" max="1.10" step="0.005">
+        <output id="cropZoomValue">3.0%</output>
+      </section>
+
+      <section class="card status-card">
+        <div class="status-title">
+          <strong>現在の診断</strong>
+          <button id="refresh" type="button">再取得</button>
+        </div>
+        <dl>
+          <div><dt>映像</dt><dd id="statusVideo">-</dd></div>
+          <div><dt>Canvas</dt><dd id="statusCanvas">-</dd></div>
+          <div><dt>Worker</dt><dd id="statusWorker">-</dd></div>
+          <div><dt>WASM</dt><dd id="statusWasm">-</dd></div>
+          <div><dt>解析時間</dt><dd id="statusProcessing">-</dd></div>
+          <div><dt>追跡</dt><dd id="statusTracking">-</dd></div>
+        </dl>
+        <p id="statusMessage" class="status-message"></p>
+      </section>
+
+      <footer>
+        <button id="reset" class="secondary" type="button">追跡状態をリセット</button>
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
