@@ -2,7 +2,7 @@
   "use strict";
   const KEY = "videoStabilizerSettings";
   const DEFAULTS = { enabled: true, applyStabilization: false, showDiagnostics: true, analysisMaxDimension: 320, analysisFps: 15, smoothingRadius: 12, cropZoom: 1.03, minConfidence: 0.3 };
-  const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, source: "", originalStyle: null, canvasBlockedUntil: 0,
+  const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, generation: 0, activeFrameId: null, lastMediaTime: null, source: "", originalStyle: null, canvasBlockedUntil: 0,
     target: null, applied: { x: 0, y: 0, angle: 0, scale: 1 }, rafHandle: null, lastRafTime: 0,
     status: { videoDetected: false, sourceSize: null, analysisSize: null, canvas: "pending", worker: "pending", wasm: "pending", wasmResult: null, processedFrames: 0, processingMs: null, featureCount: 0, confidence: 0, trackingStatus: "idle", correction: null, lastError: null } };
 
@@ -124,16 +124,24 @@
       const timeout = setTimeout(() => { if (!state.ready) { releaseBlobUrl(); update({ worker: "error", lastError: "Worker起動がタイムアウトしました" }); } }, 3000);
       worker.onmessage = ({ data }) => {
         if (data.type === "ready") { clearTimeout(timeout); releaseBlobUrl(); state.ready = true; update({ worker: "ok", wasm: data.wasm?.ok ? "ok" : "error", wasmResult: data.wasm?.result ?? null, lastError: data.wasm?.ok ? null : `WASM: ${data.wasm?.error}` }); return; }
-        if (data.type === "frame-result") { state.busy = false; if (data.error) { update({ trackingStatus: "error", lastError: data.error }); return; }
-          const result = data.result; update({ processedFrames: state.status.processedFrames + 1, processingMs: data.processingMs, featureCount: result.featureCount, confidence: result.confidence, trackingStatus: result.status, correction: result.correction, lastError: null }); applyTransform(result); }
+        if (data.type === "frame-result") {
+          if (data.generation !== state.generation || data.id !== state.activeFrameId) return;
+          state.busy = false; state.activeFrameId = null;
+          if (data.error) { update({ trackingStatus: "error", lastError: data.error }); return; }
+          const result = data.result; update({ processedFrames: state.status.processedFrames + 1, processingMs: data.processingMs, featureCount: result.featureCount, confidence: result.confidence, trackingStatus: result.status, correction: result.correction, lastError: null }); applyTransform(result);
+        }
       };
-      worker.onerror = (event) => { releaseBlobUrl(); state.busy = false; update({ worker: "error", lastError: `Worker: ${event.message || "起動失敗"}` }); };
+      worker.onerror = (event) => { releaseBlobUrl(); state.busy = false; state.activeFrameId = null; update({ worker: "error", lastError: `Worker: ${event.message || "起動失敗"}` }); };
       worker.postMessage({ type: "init", options: { smoothingRadius: state.settings.smoothingRadius, trackingMaxDimension: Math.min(240, state.settings.analysisMaxDimension) } });
     } catch (error) { update({ worker: "error", lastError: `Workerを作成できません: ${error.message || error}` }); }
   }
 
-  function stopWorker() { state.worker?.terminate(); state.worker = null; state.ready = false; state.busy = false; }
-  function resetWorker(reason) { if (state.ready) state.worker.postMessage({ type: "reset", reason }); state.busy = false; }
+  function stopWorker() { state.generation += 1; state.activeFrameId = null; state.lastMediaTime = null; state.worker?.terminate(); state.worker = null; state.ready = false; state.busy = false; }
+  function resetWorker(reason) {
+    state.generation += 1; state.activeFrameId = null; state.lastMediaTime = null;
+    if (state.ready) state.worker.postMessage({ type: "reset", reason, generation: state.generation });
+    state.busy = false;
+  }
 
   function primaryVideo() {
     return [...document.querySelectorAll("video")].filter((video) => { const rect = video.getBoundingClientRect(); return rect.width >= 160 && rect.height >= 90 && getComputedStyle(video).display !== "none"; })
@@ -153,18 +161,39 @@
   }
 
   const CANVAS_BLOCKED_RETRY_MS = 15000;
+  const TIMESTAMP_DISCONTINUITY_SECONDS = 1;
+  const TIMESTAMP_BACKWARD_TOLERANCE_SECONDS = 0.25;
+
+  function handlePlaybackBoundary(event) {
+    if (event.currentTarget !== state.video) return;
+    state.source = ""; state.lastSample = 0; state.canvasBlockedUntil = 0;
+    resetWorker(event.type); restoreTransform();
+    update({ trackingStatus: "waiting-frame", correction: null });
+  }
 
   function attach(video) {
-    if (video === state.video) return; cancelFrame(); restoreTransform(); state.video = video; state.source = ""; state.lastSample = 0; state.canvasBlockedUntil = 0; resetWorker("video-change");
-    update({ videoDetected: Boolean(video), sourceSize: video?.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : null, analysisSize: null, canvas: "pending", trackingStatus: video ? "waiting-frame" : "idle" });
-    if (video) scheduleFrame();
+    if (video === state.video) return;
+    if (state.video) { state.video.removeEventListener("seeking", handlePlaybackBoundary); state.video.removeEventListener("seeked", handlePlaybackBoundary); }
+    cancelFrame(); restoreTransform(); state.video = video; state.source = ""; state.lastSample = 0; state.canvasBlockedUntil = 0; resetWorker("video-change");
+    update({ videoDetected: Boolean(video), sourceSize: video?.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : null, analysisSize: null, canvas: "pending", trackingStatus: video ? "waiting-frame" : "idle", correction: null });
+    if (video) { video.addEventListener("seeking", handlePlaybackBoundary); video.addEventListener("seeked", handlePlaybackBoundary); scheduleFrame(); }
   }
 
   function sample(now, metadata) {
     if (!state.settings.enabled || !state.ready || state.busy || !state.video || state.video.paused || state.video.ended || document.hidden) return;
     if (now - state.lastSample < 1000 / state.settings.analysisFps || state.video.readyState < 2 || !state.video.videoWidth) return;
+    const mediaTime = Number(metadata.mediaTime ?? state.video.currentTime);
     const source = `${state.video.currentSrc}|${state.video.videoWidth}x${state.video.videoHeight}`;
     if (source !== state.source) { state.source = source; state.canvasBlockedUntil = 0; resetWorker("source-change"); }
+    const hasMediaTime = Number.isFinite(mediaTime);
+    const timestampDiscontinuity = hasMediaTime && state.lastMediaTime != null &&
+      (mediaTime < state.lastMediaTime - TIMESTAMP_BACKWARD_TOLERANCE_SECONDS || mediaTime - state.lastMediaTime > TIMESTAMP_DISCONTINUITY_SECONDS);
+    if (timestampDiscontinuity) {
+      resetWorker("timestamp-discontinuity"); restoreTransform(); state.lastMediaTime = mediaTime;
+      update({ trackingStatus: "waiting-frame", correction: null });
+      return;
+    }
+    if (hasMediaTime) state.lastMediaTime = mediaTime;
     // A SecurityError (tainted/DRM canvas) won't clear up until the source changes, so back off
     // instead of retrying drawImage()/getImageData() and re-notifying on every video frame.
     if (state.canvasBlockedUntil && now < state.canvasBlockedUntil) return;
@@ -172,12 +201,12 @@
     try {
       state.canvas ??= document.createElement("canvas"); state.context ??= state.canvas.getContext("2d", { alpha: false, willReadFrequently: true }); if (!state.context) throw new Error("2D Contextを作成できません");
       if (state.canvas.width !== width || state.canvas.height !== height) { state.canvas.width = width; state.canvas.height = height; }
-      state.context.drawImage(state.video, 0, 0, width, height); const image = state.context.getImageData(0, 0, width, height); state.lastSample = now; state.busy = true; state.frame += 1;
+      state.context.drawImage(state.video, 0, 0, width, height); const image = state.context.getImageData(0, 0, width, height); state.lastSample = now; state.busy = true; state.frame += 1; state.activeFrameId = state.frame;
       state.canvasBlockedUntil = 0;
       update({ canvas: "ok", sourceSize: `${state.video.videoWidth}×${state.video.videoHeight}`, analysisSize: `${width}×${height}`, lastError: null });
-      state.worker.postMessage({ type: "frame", id: state.frame, width, height, timestamp: metadata.mediaTime ?? state.video.currentTime, buffer: image.data.buffer }, [image.data.buffer]);
+      state.worker.postMessage({ type: "frame", id: state.activeFrameId, generation: state.generation, width, height, timestamp: hasMediaTime ? mediaTime : 0, buffer: image.data.buffer }, [image.data.buffer]);
     } catch (error) {
-      state.busy = false; state.lastSample = now;
+      state.busy = false; state.activeFrameId = null; state.lastSample = now;
       const blocked = error?.name === "SecurityError";
       if (blocked) state.canvasBlockedUntil = now + CANVAS_BLOCKED_RETRY_MS;
       update({ canvas: blocked ? "blocked" : "error", lastError: blocked ? "Twitch映像のCanvas画素取得がSecurityErrorで拒否されました" : `Canvas: ${error.message || error}` });
