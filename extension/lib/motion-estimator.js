@@ -15,6 +15,19 @@ export const DEFAULT_ESTIMATOR_OPTIONS = Object.freeze({
   smoothingRadius: 12,
   maxCorrectionRatio: 0.12,
   sceneCutThreshold: 58,
+  // Per-frame motion whose distance from the recent median exceeds this
+  // (analysis px) is treated as a tracking failure instead of being
+  // accumulated, guarding against RANSAC flipping between two large point
+  // clusters (e.g. a moving foreground over a static background).
+  spikeThreshold: 2.5,
+  // Caps how much correction.x/y may change from one accepted frame to the
+  // next (analysis px), so residual per-frame measurement noise cannot pass
+  // straight through the correction formula as visible jitter.
+  maxCorrectionDelta: 3,
+  // A hinted model (the previous frame's) is adopted only when its inlier
+  // set covers at least this fraction of the freshly-estimated best inlier
+  // set, keeping RANSAC locked onto the same dominant motion across frames.
+  hintAgreementRatio: 0.9,
 });
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -115,7 +128,34 @@ function bestPatch(first, second, width, height, x, y, options) {
       else if (error < best.second) best.second = error;
     }
   }
-  return best;
+  if (best.error === Infinity) return best;
+  const { x: subpixelX, y: subpixelY } = subpixelOffset(first, second, width, height, x, y, best, options);
+  return { ...best, x: subpixelX, y: subpixelY };
+}
+
+// Integer-only patch matching rounds any motion under ~0.5px to exactly zero.
+// That dead zone isn't just imprecision: MotionStabilizer's correction
+// formula (smooth(trajectory) - trajectory) feeds each frame's raw measurement
+// error straight back out as an opposing CSS transform, so the quantization
+// noise from rounding to whole pixels reappears as visible jitter. A cheap
+// parabolic fit through the immediate neighbors of the best integer match
+// recovers a sub-pixel offset and removes that dead zone at the source.
+function subpixelOffset(first, second, width, height, x, y, best, options) {
+  const radius = options.patchRadius;
+  const errorAt = (candidateX, candidateY) => {
+    if (candidateX - radius < 0 || candidateX + radius >= width || candidateY - radius < 0 || candidateY + radius >= height) return null;
+    return patchError(first, second, width, x, y, candidateX, candidateY, radius);
+  };
+  const parabolicOffset = (before, center, after) => {
+    if (before == null || after == null) return 0;
+    const denominator = before - 2 * center + after;
+    if (Math.abs(denominator) < 1e-6) return 0;
+    return clamp(0.5 * (before - after) / denominator, -0.5, 0.5);
+  };
+  return {
+    x: best.x + parabolicOffset(errorAt(best.x - 1, best.y), best.error, errorAt(best.x + 1, best.y)),
+    y: best.y + parabolicOffset(errorAt(best.x, best.y - 1), best.error, errorAt(best.x, best.y + 1)),
+  };
 }
 
 export function trackFeatures(previous, current, width, height, features, inputOptions = {}) {
@@ -124,7 +164,10 @@ export function trackFeatures(previous, current, width, height, features, inputO
   for (const feature of features) {
     const forward = bestPatch(previous, current, width, height, feature.x, feature.y, options);
     if (forward.error > options.maxPatchError || forward.error / forward.second > options.uniquenessRatio) continue;
-    const backward = bestPatch(current, previous, width, height, forward.x, forward.y, options);
+    // bestPatch() indexes typed arrays with its anchor (x, y), so the backward
+    // check must re-round forward's sub-pixel result to an integer anchor;
+    // the fractional forward.x/forward.y themselves are kept for the match.
+    const backward = bestPatch(current, previous, width, height, Math.round(forward.x), Math.round(forward.y), options);
     if (Math.hypot(backward.x - feature.x, backward.y - feature.y) > options.forwardBackwardThreshold) continue;
     matches.push({ x: feature.x, y: feature.y, u: forward.x, v: forward.y, error: forward.error });
   }
@@ -165,7 +208,7 @@ function refine(matches, indices) {
   return { a, b, tx: qx - a * px + b * py, ty: qy - b * px - a * py };
 }
 
-export function estimateSimilarityRansac(matches, inputOptions = {}, seed = 12345) {
+export function estimateSimilarityRansac(matches, inputOptions = {}, seed = 12345, hint = null) {
   if (matches.length < 2) return null;
   const options = optionsWith(inputOptions);
   const threshold = options.ransacThreshold ** 2;
@@ -179,16 +222,63 @@ export function estimateSimilarityRansac(matches, inputOptions = {}, seed = 1234
     if (inliers.length > best.length) best = inliers;
   }
   let model = refine(matches, best); if (!model) return null;
-  const inliers = matches.map((point, index) => errorSquared(model, point) <= threshold ? index : -1).filter((index) => index >= 0);
+  let inliers = matches.map((point, index) => errorSquared(model, point) <= threshold ? index : -1).filter((index) => index >= 0);
   model = refine(matches, inliers) ?? model;
+
+  // Prefer the previous frame's model when it explains a comparably large
+  // share of this frame's matches. Consecutive frames should track the same
+  // dominant motion; without this, a scene with two large point clusters
+  // (e.g. a moving foreground over a static background) can have RANSAC's
+  // random sampling flip between clusters frame to frame, producing large
+  // spurious jumps in the estimated motion.
+  if (hint) {
+    const hintInliers = matches.map((point, index) => errorSquared(hint, point) <= threshold ? index : -1).filter((index) => index >= 0);
+    if (hintInliers.length >= options.minTrackedPoints && hintInliers.length >= inliers.length * options.hintAgreementRatio) {
+      const hintModel = refine(matches, hintInliers);
+      if (hintModel) { model = hintModel; inliers = hintInliers; }
+    }
+  }
+
   const scale = Math.hypot(model.a, model.b);
   return { ...model, scale, angle: Math.atan2(model.b, model.a), inlierCount: inliers.length, inlierRatio: inliers.length / matches.length };
+}
+
+// Median of the x's and y's independently (not a true 2D geometric median,
+// but cheap and sufficient for spike detection on a handful of samples).
+function medianMotion(recent) {
+  if (recent.length === 0) return null;
+  const mid = Math.floor(recent.length / 2);
+  const middle = (sorted) => (sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2);
+  return {
+    x: middle(recent.map((point) => point.x).sort((left, right) => left - right)),
+    y: middle(recent.map((point) => point.y).sort((left, right) => left - right)),
+  };
+}
+
+// Limits how far correction.x/y may move in one accepted frame. angle/logScale
+// are left to their existing absolute clamps (DEFAULT_ESTIMATOR_OPTIONS above)
+// since rotation/scale spikes are comparatively rare for this use case.
+function limitCorrectionStep(current, target, maxDelta) {
+  return {
+    x: current.x + clamp(target.x - current.x, -maxDelta, maxDelta),
+    y: current.y + clamp(target.y - current.y, -maxDelta, maxDelta),
+    angle: target.angle,
+    logScale: target.logScale,
+  };
 }
 
 export class MotionStabilizer {
   constructor(options = {}) { this.options = optionsWith(options); this.reset(); }
   configure(options = {}) { this.options = optionsWith({ ...this.options, ...options }); this.reset(); }
-  reset() { this.previous = null; this.trajectory = { x: 0, y: 0, angle: 0, logScale: 0 }; this.history = [{ ...this.trajectory }]; this.correction = { x: 0, y: 0, angle: 0, logScale: 0 }; this.frame = 0; }
+  reset() { this.previous = null; this.trajectory = { x: 0, y: 0, angle: 0, logScale: 0 }; this.history = [{ ...this.trajectory }]; this.correction = { x: 0, y: 0, angle: 0, logScale: 0 }; this.frame = 0; this.recentMotion = []; this.lastModel = null; }
+
+  // Shared by tracking-failure and spike rejection: decay the correction
+  // instead of accumulating this frame's (untrusted) motion into trajectory.
+  reject(current, width, height, extra) {
+    this.previous = current;
+    this.correction.x *= 0.84; this.correction.y *= 0.84; this.correction.angle *= 0.84; this.correction.logScale *= 0.84;
+    return this.result("tracking-failed", width, height, extra);
+  }
 
   result(status, width, height, extra = {}) {
     return { status, sourceWidth: width, sourceHeight: height, featureCount: 0, trackedCount: 0, inlierCount: 0, inlierRatio: 0, confidence: 0,
@@ -207,19 +297,42 @@ export class MotionStabilizer {
     }
     const features = detectFeatures(this.previous.data, current.width, current.height, this.options);
     const matches = trackFeatures(this.previous.data, current.data, current.width, current.height, features, this.options);
-    const model = matches.length >= this.options.minTrackedPoints ? estimateSimilarityRansac(matches, this.options, this.frame * 2654435761) : null;
+    // A fixed seed keeps RANSAC's random sampling reproducible frame to frame
+    // (it no longer needs to vary per frame now that `hint` pins the model to
+    // the previous frame's dominant motion); `this.lastModel` is that hint.
+    const model = matches.length >= this.options.minTrackedPoints ? estimateSimilarityRansac(matches, this.options, 12345, this.lastModel) : null;
     if (!model || model.inlierRatio < this.options.minInlierRatio) {
-      this.previous = current; this.correction.x *= 0.84; this.correction.y *= 0.84; this.correction.angle *= 0.84; this.correction.logScale *= 0.84;
-      return this.result("tracking-failed", width, height, { featureCount: features.length, trackedCount: matches.length, inlierCount: model?.inlierCount ?? 0, inlierRatio: model?.inlierRatio ?? 0 });
+      return this.reject(current, width, height, { featureCount: features.length, trackedCount: matches.length, inlierCount: model?.inlierCount ?? 0, inlierRatio: model?.inlierRatio ?? 0 });
     }
     const motion = { x: model.tx / current.scaleX, y: model.ty / current.scaleY, angle: model.angle, scale: model.scale };
+
+    // Spike gate: a frame whose motion jumps far from the recent median is
+    // more likely a RANSAC mis-lock than real camera motion, so it's rejected
+    // (like a tracking failure) instead of being folded into trajectory. The
+    // buffer is fed regardless of accept/reject: a single isolated spike stays
+    // a minority in the buffer and the median resists it, but a *sustained*
+    // new motion (e.g. a real pan faster than spikeThreshold/frame) becomes
+    // the buffer's majority within a few frames and the median follows it, so
+    // the gate reopens instead of rejecting every frame of the pan forever.
+    const median = medianMotion(this.recentMotion);
+    const spikeDistance = median ? Math.hypot(motion.x - median.x, motion.y - median.y) : 0;
+    const isSpike = this.recentMotion.length >= 3 && spikeDistance > this.options.spikeThreshold;
+    this.recentMotion.push({ x: motion.x, y: motion.y }); while (this.recentMotion.length > 5) this.recentMotion.shift();
+    if (isSpike) {
+      return this.reject(current, width, height, { featureCount: features.length, trackedCount: matches.length, inlierCount: model.inlierCount, inlierRatio: model.inlierRatio });
+    }
+    this.lastModel = { a: model.a, b: model.b, tx: model.tx, ty: model.ty };
+
     this.trajectory.x += motion.x; this.trajectory.y += motion.y; this.trajectory.angle += motion.angle; this.trajectory.logScale += Math.log(motion.scale);
     this.history.push({ ...this.trajectory }); while (this.history.length > this.options.smoothingRadius) this.history.shift();
     const smooth = this.history.reduce((sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y, angle: sum.angle + point.angle, logScale: sum.logScale + point.logScale }), { x: 0, y: 0, angle: 0, logScale: 0 });
     for (const key of Object.keys(smooth)) smooth[key] /= this.history.length;
-    this.correction = { x: clamp(smooth.x - this.trajectory.x, -width * this.options.maxCorrectionRatio, width * this.options.maxCorrectionRatio),
+    const targetCorrection = { x: clamp(smooth.x - this.trajectory.x, -width * this.options.maxCorrectionRatio, width * this.options.maxCorrectionRatio),
       y: clamp(smooth.y - this.trajectory.y, -height * this.options.maxCorrectionRatio, height * this.options.maxCorrectionRatio),
       angle: clamp(smooth.angle - this.trajectory.angle, -0.1, 0.1), logScale: clamp(smooth.logScale - this.trajectory.logScale, -0.08, 0.08) };
+    // Cap how far x/y may move from the previous accepted frame so residual
+    // per-frame measurement noise can't pass straight through as jitter.
+    this.correction = limitCorrectionStep(this.correction, targetCorrection, this.options.maxCorrectionDelta);
     this.previous = current;
     const confidence = clamp(model.inlierRatio * Math.min(1, matches.length / 30), 0, 1);
     return this.result("ok", width, height, { timestamp, featureCount: features.length, trackedCount: matches.length, inlierCount: model.inlierCount, inlierRatio: model.inlierRatio, confidence, motion,

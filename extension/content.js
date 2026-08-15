@@ -3,6 +3,7 @@
   const KEY = "videoStabilizerSettings";
   const DEFAULTS = { enabled: true, applyStabilization: false, showDiagnostics: true, analysisMaxDimension: 320, analysisFps: 15, smoothingRadius: 12, cropZoom: 1.03, minConfidence: 0.3 };
   const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, source: "", originalStyle: null, canvasBlockedUntil: 0,
+    target: null, applied: { x: 0, y: 0, angle: 0, scale: 1 }, rafHandle: null, lastRafTime: 0,
     status: { videoDetected: false, sourceSize: null, analysisSize: null, canvas: "pending", worker: "pending", wasm: "pending", wasmResult: null, processedFrames: 0, processingMs: null, featureCount: 0, confidence: 0, trackingStatus: "idle", correction: null, lastError: null } };
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -40,33 +41,93 @@
   function snapshot() { return { settings: { ...state.settings }, diagnostic: { ...state.status, correction: state.status.correction ? { ...state.status.correction } : null } }; }
 
   function restoreTransform() {
+    if (state.rafHandle != null) { cancelAnimationFrame(state.rafHandle); state.rafHandle = null; }
+    state.target = null; state.applied = { x: 0, y: 0, angle: 0, scale: 1 };
     if (!state.video || !state.originalStyle) return;
     for (const [property, style] of Object.entries(state.originalStyle)) style.value ? state.video.style.setProperty(property, style.value, style.priority) : state.video.style.removeProperty(property);
     state.originalStyle = null;
   }
 
+  const APPLIED_REST_EPSILON = { x: 0.05, y: 0.05, angle: 0.0005, scale: 0.0003 };
+
+  // Worker results land at analysisFps (typically 15Hz); applying each one
+  // straight to the CSS transform turned smooth real motion into a
+  // sample-and-hold sawtooth at display framerate (~60Hz), which itself reads
+  // as fine jitter. Instead each result only updates a `target`, and a
+  // requestAnimationFrame loop eases `applied` toward it every display frame.
+  // The time constant shrinks for larger steps so genuine motion is still
+  // followed promptly, while small steps (mostly measurement noise) are
+  // filtered more heavily.
+  function stepTowardTarget(deltaMs) {
+    const target = state.target ?? { x: 0, y: 0, angle: 0, scale: 1 };
+    const stepPixels = Math.hypot(target.x - state.applied.x, target.y - state.applied.y);
+    const tauMs = clamp(70 - stepPixels * 3, 25, 70);
+    const alpha = 1 - Math.exp(-deltaMs / tauMs);
+    state.applied = {
+      x: state.applied.x + (target.x - state.applied.x) * alpha,
+      y: state.applied.y + (target.y - state.applied.y) * alpha,
+      angle: state.applied.angle + (target.angle - state.applied.angle) * alpha,
+      scale: state.applied.scale + (target.scale - state.applied.scale) * alpha,
+    };
+  }
+
+  function renderTransformFrame(now) {
+    state.rafHandle = null;
+    if (!state.video) return;
+    const deltaMs = state.lastRafTime ? Math.min(64, now - state.lastRafTime) : 16;
+    state.lastRafTime = now;
+    stepTowardTarget(deltaMs);
+    const atRestIdentity = state.target == null &&
+      Math.abs(state.applied.x) < APPLIED_REST_EPSILON.x && Math.abs(state.applied.y) < APPLIED_REST_EPSILON.y &&
+      Math.abs(state.applied.angle) < APPLIED_REST_EPSILON.angle && Math.abs(state.applied.scale - 1) < APPLIED_REST_EPSILON.scale;
+    if (atRestIdentity) { restoreTransform(); return; }
+    if (!state.originalStyle) {
+      state.originalStyle = Object.fromEntries(["transform", "transform-origin", "transition", "will-change"].map((property) => [property, { value: state.video.style.getPropertyValue(property), priority: state.video.style.getPropertyPriority(property) }]));
+      state.video.style.setProperty("transform-origin", "50% 50%", "important"); state.video.style.setProperty("transition", "none", "important"); state.video.style.setProperty("will-change", "transform", "important");
+    }
+    state.video.style.setProperty("transform", `translate3d(${state.applied.x.toFixed(3)}px,${state.applied.y.toFixed(3)}px,0) rotate(${state.applied.angle.toFixed(6)}rad) scale(${state.applied.scale.toFixed(6)})`, "important");
+    state.rafHandle = requestAnimationFrame(renderTransformFrame);
+  }
+
+  function ensureRenderLoop() {
+    if (state.rafHandle == null && state.video) { state.lastRafTime = 0; state.rafHandle = requestAnimationFrame(renderTransformFrame); }
+  }
+
   function applyTransform(result) {
-    if (!state.video || !state.settings.applyStabilization || !result?.correction) { restoreTransform(); return; }
-    if (result.status === "ok" && result.confidence < state.settings.minConfidence) return;
-    if (!state.originalStyle) state.originalStyle = Object.fromEntries(["transform", "transform-origin", "transition", "will-change"].map((property) => [property, { value: state.video.style.getPropertyValue(property), priority: state.video.style.getPropertyPriority(property) }]));
+    if (!state.video || !state.settings.applyStabilization) { restoreTransform(); return; }
+    // A confident correction becomes the new interpolation target; anything
+    // else (missing correction, or confidence below the threshold) fades
+    // translation/rotation back to neutral instead of freezing whatever was
+    // last applied. Scale stays at cropZoom (not 1) so toggling in and out of
+    // "confident" near the threshold doesn't also pulse the zoom level.
+    if (!result?.correction || (result.status === "ok" && result.confidence < state.settings.minConfidence)) { state.target = { x: 0, y: 0, angle: 0, scale: state.settings.cropZoom }; ensureRenderLoop(); return; }
     const rect = state.video.getBoundingClientRect(); const x = result.correction.x * rect.width / result.sourceWidth; const y = result.correction.y * rect.height / result.sourceHeight;
     const scale = clamp(state.settings.cropZoom * result.correction.scale, 0.92, 1.2);
-    state.video.style.setProperty("transform-origin", "50% 50%", "important"); state.video.style.setProperty("transition", "none", "important"); state.video.style.setProperty("will-change", "transform", "important");
-    state.video.style.setProperty("transform", `translate3d(${x.toFixed(3)}px,${y.toFixed(3)}px,0) rotate(${result.correction.angle.toFixed(6)}rad) scale(${scale.toFixed(6)})`, "important");
+    state.target = { x, y, angle: result.correction.angle, scale };
+    ensureRenderLoop();
   }
 
   function startWorker() {
     if (state.worker || !state.settings.enabled) return;
     update({ worker: "starting", wasm: "pending", lastError: null });
     try {
-      const worker = new Worker(chrome.runtime.getURL("worker.js"), { type: "module", name: "twitch-video-stabilizer" }); state.worker = worker;
-      const timeout = setTimeout(() => { if (!state.ready) update({ worker: "error", lastError: "Worker起動がタイムアウトしました" }); }, 3000);
+      // Chromeはcontent script(ページorigin)からのWorker生成時に、chrome-extension://の
+      // スクリプトURLを直接渡すと「cannot be accessed from origin」で拒否する
+      // (web_accessible_resourcesはWorker()自体の同一オリジン判定を免除しない)。
+      // 同一origin(このページ)で生成したBlob URLをブートストラップとして経由させ、
+      // その中でchrome-extension://の実体をimportすることで、web_accessible_resources
+      // に基づく通常のモジュール解決経路に載せる。
+      const scriptUrl = chrome.runtime.getURL("worker.js");
+      const blobUrl = URL.createObjectURL(new Blob([`import ${JSON.stringify(scriptUrl)};`], { type: "text/javascript" }));
+      const releaseBlobUrl = () => URL.revokeObjectURL(blobUrl);
+      const worker = new Worker(blobUrl, { type: "module", name: "twitch-video-stabilizer" }); state.worker = worker;
+      const timeout = setTimeout(() => { if (!state.ready) { releaseBlobUrl(); update({ worker: "error", lastError: "Worker起動がタイムアウトしました" }); } }, 3000);
       worker.onmessage = ({ data }) => {
-        if (data.type === "ready") { clearTimeout(timeout); state.ready = true; update({ worker: "ok", wasm: data.wasm?.ok ? "ok" : "error", wasmResult: data.wasm?.result ?? null, lastError: data.wasm?.ok ? null : `WASM: ${data.wasm?.error}` }); return; }
+        if (data.type === "ready") { clearTimeout(timeout); releaseBlobUrl(); state.ready = true; update({ worker: "ok", wasm: data.wasm?.ok ? "ok" : "error", wasmResult: data.wasm?.result ?? null, lastError: data.wasm?.ok ? null : `WASM: ${data.wasm?.error}` }); return; }
         if (data.type === "frame-result") { state.busy = false; if (data.error) { update({ trackingStatus: "error", lastError: data.error }); return; }
           const result = data.result; update({ processedFrames: state.status.processedFrames + 1, processingMs: data.processingMs, featureCount: result.featureCount, confidence: result.confidence, trackingStatus: result.status, correction: result.correction, lastError: null }); applyTransform(result); }
       };
-      worker.onerror = (event) => { state.busy = false; update({ worker: "error", lastError: `Worker: ${event.message || "起動失敗"}` }); };
+      worker.onerror = (event) => { releaseBlobUrl(); state.busy = false; update({ worker: "error", lastError: `Worker: ${event.message || "起動失敗"}` }); };
       worker.postMessage({ type: "init", options: { smoothingRadius: state.settings.smoothingRadius, trackingMaxDimension: Math.min(240, state.settings.analysisMaxDimension) } });
     } catch (error) { update({ worker: "error", lastError: `Workerを作成できません: ${error.message || error}` }); }
   }
