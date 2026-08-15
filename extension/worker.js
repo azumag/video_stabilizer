@@ -93,7 +93,7 @@ self.addEventListener("message", async (event) => {
 
   if (message.type === "reset") {
     stabilizer.reset(message.reason ?? "requested");
-    safePostMessage({ type: "reset-complete", reason: message.reason ?? "requested" });
+    safePostMessage({ type: "reset-complete", reason: message.reason ?? "requested", generation: message.generation });
     return;
   }
 
@@ -105,6 +105,7 @@ self.addEventListener("message", async (event) => {
     safePostMessage({
       type: "frame-result",
       id: message.id,
+      generation: message.generation,
       error: "Worker has not been initialized",
     });
     return;
@@ -121,6 +122,7 @@ self.addEventListener("message", async (event) => {
     safePostMessage({
       type: "frame-result",
       id: message.id,
+      generation: message.generation,
       processingMs: performance.now() - startedAt,
       result,
     });
@@ -128,6 +130,7 @@ self.addEventListener("message", async (event) => {
     safePostMessage({
       type: "frame-result",
       id: message.id,
+      generation: message.generation,
       processingMs: performance.now() - startedAt,
       error: error instanceof Error ? error.message : String(error),
     });
