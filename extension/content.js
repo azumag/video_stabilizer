@@ -2,8 +2,12 @@
   "use strict";
   const KEY = "videoStabilizerSettings";
   const DEFAULTS = { enabled: true, applyStabilization: false, showDiagnostics: true, analysisMaxDimension: 320, analysisFps: 15, smoothingRadius: 12, cropZoom: 1.03, minConfidence: 0.3 };
+  const PANEL_ID = "__azumag_video_stabilizer_diagnostics";
+  const PANEL_STORAGE_KEY = "azumagVideoStabilizerPanel";
+  const PANEL_MARGIN = 12;
+
   const state = { settings: { ...DEFAULTS }, video: null, worker: null, ready: false, busy: false, canvas: null, context: null, callback: null, callbackType: null, lastSample: 0, frame: 0, generation: 0, activeFrameId: null, lastMediaTime: null, source: "", originalStyle: null, canvasBlockedUntil: 0,
-    target: null, applied: { x: 0, y: 0, angle: 0, scale: 1 }, rafHandle: null, lastRafTime: 0,
+    target: null, applied: { x: 0, y: 0, angle: 0, scale: 1 }, rafHandle: null, lastRafTime: 0, panel: loadPanelState(), panelRefs: {},
     status: { videoDetected: false, sourceSize: null, analysisSize: null, canvas: "pending", worker: "pending", wasm: "pending", wasmResult: null, processedFrames: 0, processingMs: null, featureCount: 0, confidence: 0, trackingStatus: "idle", correction: null, lastError: null } };
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -13,22 +17,107 @@
     analysisMaxDimension: clamp(Math.round(Number(value.analysisMaxDimension) || 320), 160, 640), analysisFps: clamp(Math.round(Number(value.analysisFps) || 15), 5, 30),
     smoothingRadius: clamp(Math.round(Number(value.smoothingRadius) || 12), 2, 60), cropZoom: clamp(Number(value.cropZoom) || 1.03, 1, 1.15), minConfidence: clamp(Number(value.minConfidence) || 0.3, 0, 1) });
 
-  function overlay() {
-    let host = document.getElementById("__azumag_video_stabilizer_diagnostics");
-    if (!state.settings.showDiagnostics) { host?.remove(); return null; }
-    if (host) return host;
-    host = document.createElement("div"); host.id = "__azumag_video_stabilizer_diagnostics";
-    host.style.cssText = "all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483647;width:292px;padding:11px 13px;border:1px solid #ffffff3d;border-radius:10px;background:#0c0c10e8;color:#f4f4f5;box-shadow:0 8px 28px #0008;font:12px/1.45 system-ui,-apple-system,sans-serif;pointer-events:none;white-space:pre-wrap";
-    (document.documentElement || document.body).append(host); return host;
+  // The panel's screen position/minimized state survive page reloads (this
+  // page's own localStorage, not chrome.storage.sync, since it's purely a
+  // per-device UI preference) so dragging it away from Twitch's chat input
+  // once doesn't have to be repeated on every reload.
+  function loadPanelState() {
+    try { return { minimized: false, left: null, top: null, ...JSON.parse(localStorage.getItem(PANEL_STORAGE_KEY) ?? "{}") }; }
+    catch { return { minimized: false, left: null, top: null }; }
   }
+  function savePanelState(patch) {
+    state.panel = { ...state.panel, ...patch };
+    try { localStorage.setItem(PANEL_STORAGE_KEY, JSON.stringify(state.panel)); } catch {}
+  }
+
+  function clampPanelPosition(left, top) {
+    const panelEl = state.panelRefs.panelEl;
+    const width = panelEl?.offsetWidth || 292; const height = panelEl?.offsetHeight || 32;
+    return { left: clamp(left, 0, Math.max(0, innerWidth - width)), top: clamp(top, 0, Math.max(0, innerHeight - height)) };
+  }
+
+  function applyPanelPosition() {
+    const { host } = state.panelRefs; if (!host) return;
+    if (state.panel.left == null || state.panel.top == null) {
+      host.style.left = ""; host.style.top = ""; host.style.right = `${PANEL_MARGIN}px`; host.style.bottom = `${PANEL_MARGIN}px`;
+      return;
+    }
+    const { left, top } = clampPanelPosition(state.panel.left, state.panel.top);
+    host.style.right = ""; host.style.bottom = ""; host.style.left = `${left}px`; host.style.top = `${top}px`;
+  }
+
+  function startPanelDrag(event) {
+    const { host } = state.panelRefs; if (!host || event.button !== 0) return;
+    event.preventDefault();
+    const handle = event.currentTarget;
+    // Pointer capture keeps drag events targeted at the handle even if the
+    // cursor leaves it mid-drag (e.g. over a cross-origin ad iframe), and
+    // lets listeners live on the handle instead of window with no leak risk.
+    handle.setPointerCapture?.(event.pointerId);
+    const rect = host.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left; const offsetY = event.clientY - rect.top;
+    const onMove = (moveEvent) => {
+      const { left, top } = clampPanelPosition(moveEvent.clientX - offsetX, moveEvent.clientY - offsetY);
+      host.style.right = ""; host.style.bottom = ""; host.style.left = `${left}px`; host.style.top = `${top}px`;
+      state.panel.left = left; state.panel.top = top;
+    };
+    const onUp = () => { handle.removeEventListener("pointermove", onMove); handle.removeEventListener("pointerup", onUp); handle.removeEventListener("pointercancel", onUp); savePanelState({ left: state.panel.left, top: state.panel.top }); };
+    handle.addEventListener("pointermove", onMove); handle.addEventListener("pointerup", onUp, { once: true }); handle.addEventListener("pointercancel", onUp, { once: true });
+  }
+
+  // A shadow root keeps Twitch's page CSS from bleeding into the panel (and
+  // vice versa) now that it has interactive children (drag handle, minimize
+  // button) instead of being a plain click-through text overlay.
+  function overlay() {
+    const existing = document.getElementById(PANEL_ID);
+    if (!state.settings.showDiagnostics) { existing?.remove(); state.panelRefs = {}; return null; }
+    if (existing && state.panelRefs.host === existing) return existing;
+    existing?.remove();
+    const host = document.createElement("div"); host.id = PANEL_ID;
+    // pointer-events:none on the host + explicit :auto only on .header means
+    // only the ~30px drag bar can block clicks to whatever's underneath
+    // (e.g. Twitch's chat input, which sits under the default bottom-right
+    // position) - the diagnostic text body stays fully click-through.
+    host.style.cssText = "all:initial;position:fixed;z-index:2147483647;pointer-events:none;";
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `<style>
+      .panel{width:292px;border:1px solid #ffffff3d;border-radius:10px;background:#0c0c10e8;color:#f4f4f5;box-shadow:0 8px 28px #0008;font:12px/1.45 system-ui,-apple-system,sans-serif;overflow:hidden}
+      .panel.minimized{width:auto}
+      .header{display:flex;align-items:center;gap:6px;padding:6px 9px;cursor:move;user-select:none;background:#ffffff14;touch-action:none;pointer-events:auto}
+      .title{flex:1;font-weight:600;white-space:nowrap}
+      .btn{all:unset;cursor:pointer;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:4px;font-size:13px;line-height:1}
+      .btn:hover{background:#ffffff26}
+      .body{padding:5px 13px 11px;white-space:pre-wrap;pointer-events:none}
+      .panel.minimized .body{display:none}
+    </style>
+    <div class="panel" part="panel">
+      <div class="header" data-drag-handle>
+        <span class="title">Video Stabilizer</span>
+        <button class="btn" data-minimize type="button" title="最小化/復元">-</button>
+      </div>
+      <div class="body" data-body></div>
+    </div>`;
+    const panelEl = shadow.querySelector(".panel"); const bodyEl = shadow.querySelector("[data-body]"); const minimizeBtn = shadow.querySelector("[data-minimize]");
+    state.panelRefs = { host, panelEl, bodyEl };
+    shadow.querySelector("[data-drag-handle]").addEventListener("pointerdown", startPanelDrag);
+    // stopPropagation so clicking the button doesn't also start a drag via
+    // the handle's own pointerdown listener (the button is inside it).
+    minimizeBtn.addEventListener("pointerdown", (event) => event.stopPropagation());
+    minimizeBtn.addEventListener("click", () => { savePanelState({ minimized: !state.panel.minimized }); panelEl.classList.toggle("minimized", state.panel.minimized); minimizeBtn.textContent = state.panel.minimized ? "+" : "-"; });
+    panelEl.classList.toggle("minimized", state.panel.minimized); minimizeBtn.textContent = state.panel.minimized ? "+" : "-";
+    (document.documentElement || document.body).append(host);
+    applyPanelPosition();
+    return host;
+  }
+  addEventListener("resize", () => { if (state.panel.left != null) applyPanelPosition(); });
 
   function word(value) { return ({ pending: "待機", starting: "起動中", ok: "OK", blocked: "取得不可", error: "エラー" })[value] ?? String(value); }
   function render() {
-    const host = overlay(); if (!host) return; const s = state.status;
+    const host = overlay(); if (!host || !state.panelRefs.bodyEl) return; const s = state.status;
     const video = s.videoDetected ? `${s.sourceSize ?? "読込中"} → ${s.analysisSize ?? "待機"}` : "未検出";
     const wasm = s.wasm === "ok" ? `OK（${s.wasmResult}）` : word(s.wasm);
     const correction = !state.settings.applyStabilization ? "計測のみ（適用OFF）" : s.correction ? `x ${s.correction.x.toFixed(1)} / y ${s.correction.y.toFixed(1)} / ${(s.correction.angle * 57.2958).toFixed(2)}°` : "待機";
-    host.textContent = `Twitch Video Stabilizer  [Phase 0]\n映像     ${video}\nCanvas   ${word(s.canvas)}\nWorker   ${word(s.worker)}\nWASM     ${wasm}\n解析     ${state.settings.analysisFps} fps / ${Number.isFinite(s.processingMs) ? s.processingMs.toFixed(1) : "-"} ms / ${s.processedFrames}\n追跡     ${s.trackingStatus} / ${s.featureCount}点 / ${Math.round(s.confidence * 100)}%\n補正     ${correction}${s.lastError ? `\nERROR    ${s.lastError}` : ""}`;
+    state.panelRefs.bodyEl.textContent = `[Phase 0]\n映像     ${video}\nCanvas   ${word(s.canvas)}\nWorker   ${word(s.worker)}\nWASM     ${wasm}\n解析     ${state.settings.analysisFps} fps / ${Number.isFinite(s.processingMs) ? s.processingMs.toFixed(1) : "-"} ms / ${s.processedFrames}\n追跡     ${s.trackingStatus} / ${s.featureCount}点 / ${Math.round(s.confidence * 100)}%\n補正     ${correction}${s.lastError ? `\nERROR    ${s.lastError}` : ""}`;
   }
 
   function update(patch) {
@@ -125,11 +214,25 @@
       worker.onmessage = ({ data }) => {
         if (data.type === "ready") { clearTimeout(timeout); releaseBlobUrl(); state.ready = true; update({ worker: "ok", wasm: data.wasm?.ok ? "ok" : "error", wasmResult: data.wasm?.result ?? null, lastError: data.wasm?.ok ? null : `WASM: ${data.wasm?.error}` }); return; }
         if (data.type === "frame-result") {
+          // Stale (superseded by a reset) results are dropped before touching
+          // `busy`/diagnostics/transform state - resetWorker() already cleared
+          // `busy` synchronously when it bumped `generation`, and a late result
+          // for the old generation/id must not clobber whatever's in flight now.
           if (data.generation !== state.generation || data.id !== state.activeFrameId) return;
           state.busy = false; state.activeFrameId = null;
           if (data.error) { update({ trackingStatus: "error", lastError: data.error }); return; }
           const result = data.result; update({ processedFrames: state.status.processedFrames + 1, processingMs: data.processingMs, featureCount: result.featureCount, confidence: result.confidence, trackingStatus: result.status, correction: result.correction, lastError: null }); applyTransform(result);
+          return;
         }
+        // "configured"/"reset-complete" are benign acks unrelated to `busy`
+        // (worker.js sends them for "configure"/"reset" messages, which don't
+        // set `busy`) and must not be treated as errors.
+        if (data.type === "configured" || data.type === "reset-complete") return;
+        // Any other message (e.g. worker.js's safePostMessage() falling back to
+        // "worker-error" when postMessage() itself throws) must still clear
+        // `busy`, or sample()'s busy-guard could permanently block every future
+        // frame if this was the response to the currently in-flight one.
+        if (state.busy) { state.busy = false; state.activeFrameId = null; update({ trackingStatus: "error", lastError: data.error ?? "Worker: 不明な応答" }); }
       };
       worker.onerror = (event) => { releaseBlobUrl(); state.busy = false; state.activeFrameId = null; update({ worker: "error", lastError: `Worker: ${event.message || "起動失敗"}` }); };
       worker.postMessage({ type: "init", options: { smoothingRadius: state.settings.smoothingRadius, trackingMaxDimension: Math.min(240, state.settings.analysisMaxDimension) } });

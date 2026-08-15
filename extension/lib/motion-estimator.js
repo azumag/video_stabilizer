@@ -18,8 +18,12 @@ export const DEFAULT_ESTIMATOR_OPTIONS = Object.freeze({
   // Per-frame motion whose distance from the recent median exceeds this
   // (analysis px) is treated as a tracking failure instead of being
   // accumulated, guarding against RANSAC flipping between two large point
-  // clusters (e.g. a moving foreground over a static background).
-  spikeThreshold: 2.5,
+  // clusters (e.g. a moving foreground over a static background). Real
+  // encoded footage (compression artifacts, genuine fast pans) varies more
+  // frame to frame than clean synthetic test data, so this is set well above
+  // typical noise and only meant to catch large mis-locks, not to react to
+  // ordinary motion.
+  spikeThreshold: 6,
   // Caps how much correction.x/y may change from one accepted frame to the
   // next (analysis px), so residual per-frame measurement noise cannot pass
   // straight through the correction formula as visible jitter.
