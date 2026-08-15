@@ -163,6 +163,7 @@
   const CANVAS_BLOCKED_RETRY_MS = 15000;
   const TIMESTAMP_DISCONTINUITY_SECONDS = 1;
   const TIMESTAMP_BACKWARD_TOLERANCE_SECONDS = 0.25;
+  const PLAYBACK_BOUNDARY_EVENTS = ["seeking", "seeked", "loadstart", "emptied"];
 
   function handlePlaybackBoundary(event) {
     if (event.currentTarget !== state.video) return;
@@ -173,10 +174,10 @@
 
   function attach(video) {
     if (video === state.video) return;
-    if (state.video) { state.video.removeEventListener("seeking", handlePlaybackBoundary); state.video.removeEventListener("seeked", handlePlaybackBoundary); }
+    if (state.video) for (const type of PLAYBACK_BOUNDARY_EVENTS) state.video.removeEventListener(type, handlePlaybackBoundary);
     cancelFrame(); restoreTransform(); state.video = video; state.source = ""; state.lastSample = 0; state.canvasBlockedUntil = 0; resetWorker("video-change");
     update({ videoDetected: Boolean(video), sourceSize: video?.videoWidth ? `${video.videoWidth}×${video.videoHeight}` : null, analysisSize: null, canvas: "pending", trackingStatus: video ? "waiting-frame" : "idle", correction: null });
-    if (video) { video.addEventListener("seeking", handlePlaybackBoundary); video.addEventListener("seeked", handlePlaybackBoundary); scheduleFrame(); }
+    if (video) { for (const type of PLAYBACK_BOUNDARY_EVENTS) video.addEventListener(type, handlePlaybackBoundary); scheduleFrame(); }
   }
 
   function sample(now, metadata) {
