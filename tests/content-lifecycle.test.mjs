@@ -189,6 +189,27 @@ test("old worker results are ignored after the primary video changes", async () 
   assert.equal(latest.status.diagnostic.processedFrames, 1);
 });
 
+test("source lifecycle events invalidate an in-flight frame before the next sample", async () => {
+  const video = createVideo("quality-a");
+  const harness = await createHarness(video);
+
+  video.fireFrame(100, 0.1);
+  const oldFrame = frameMessages(harness.worker).at(-1);
+  assert.ok(oldFrame);
+
+  video.currentSrc = "https://example.test/quality-b.m3u8";
+  video.fire("loadstart");
+  assert.equal(resetMessages(harness.worker).at(-1).reason, "loadstart");
+
+  const beforeOldResult = harness.diagnostics.length;
+  harness.worker.onmessage({ data: frameResult(oldFrame) });
+  assert.equal(harness.diagnostics.length, beforeOldResult, "old-source result must be ignored immediately after loadstart");
+
+  video.fireFrame(200, 0.2);
+  const newFrame = frameMessages(harness.worker).at(-1);
+  assert.ok(newFrame.generation > oldFrame.generation);
+});
+
 test("seeking and large media-time jumps reset tracking and invalidate in-flight frames", async () => {
   const video = createVideo("vod");
   const harness = await createHarness(video);
